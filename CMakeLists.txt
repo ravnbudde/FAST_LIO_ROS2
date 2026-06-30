@@ -92,32 +92,47 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 )
 ament_export_dependencies(rosidl_default_runtime)
 
-add_executable(fastlio_mapping src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
-target_include_directories(fastlio_mapping PUBLIC
+add_library(fastlio_mapping_component SHARED
+  src/laser_mapping_node.cpp
+  src/preprocess.cpp
+  include/ikd-Tree/ikd_Tree.cpp
+)
+target_include_directories(fastlio_mapping_component PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
   ${PCL_INCLUDE_DIRS}
 )
-target_link_libraries(fastlio_mapping ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen)
-target_include_directories(fastlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
+target_link_libraries(fastlio_mapping_component ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen)
+target_include_directories(fastlio_mapping_component PRIVATE ${PYTHON_INCLUDE_DIRS})
+ament_target_dependencies(fastlio_mapping_component ${dependencies})
+
+add_executable(fastlio_mapping src/laser_mapping_main.cpp)
+target_link_libraries(fastlio_mapping fastlio_mapping_component)
+ament_target_dependencies(fastlio_mapping rclcpp)
+
+rclcpp_components_register_nodes(fastlio_mapping_component "fast_lio::LaserMappingNode")
 
 list(APPEND EOL_LIST "foxy" "galactic" "eloquent" "dashing" "crystal")
 
 if($ENV{ROS_DISTRO} IN_LIST EOL_LIST)
   # Custommsg to support foxy & galactic
-  rosidl_target_interfaces(fastlio_mapping
+  rosidl_target_interfaces(fastlio_mapping_component
     ${PROJECT_NAME} "rosidl_typesupport_cpp")
 else()
   rosidl_get_typesupport_target(cpp_typesupport_target
     ${PROJECT_NAME} "rosidl_typesupport_cpp")
-  target_link_libraries(fastlio_mapping ${cpp_typesupport_target})
+  target_link_libraries(fastlio_mapping_component ${cpp_typesupport_target})
 endif()
-
-ament_target_dependencies(fastlio_mapping ${dependencies})
 
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping
   DESTINATION lib/${PROJECT_NAME}
+)
+
+install(TARGETS fastlio_mapping_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
 )
 
 install(

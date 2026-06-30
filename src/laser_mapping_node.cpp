@@ -793,11 +793,13 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - solve_start_;
 }
 
-class LaserMappingNode : public rclcpp::Node
+#include "fast_lio/laser_mapping_node.hpp"
+
+namespace fast_lio
 {
-public:
-    LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
-    {
+
+LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("laser_mapping", options)
+{
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
@@ -947,16 +949,54 @@ public:
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
-    ~LaserMappingNode()
+LaserMappingNode::~LaserMappingNode()
+{
+    write_runtime_outputs();
+    fout_out.close();
+    fout_pre.close();
+    fout_dbg.close();
+    if (fp != nullptr)
     {
-        fout_out.close();
-        fout_pre.close();
         fclose(fp);
+        fp = nullptr;
     }
+}
 
-private:
-    void timer_callback()
-    {
+void LaserMappingNode::write_runtime_outputs()
+{
+        /**************** save map ****************/
+        /* 1. make sure you have enough memories
+        /* 2. pcd save will largely influence the real-time performences **/
+        if (pcl_wait_save->size() > 0 && pcd_save_en)
+        {
+            string file_name = string("scans.pcd");
+            string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
+            pcl::PCDWriter pcd_writer;
+            cout << "current scan saved to /PCD/" << file_name<<endl;
+            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+        }
+
+        if (runtime_pos_log)
+        {
+            vector<double> t, s_vec, s_vec2, s_vec3, s_vec4, s_vec5, s_vec6, s_vec7;    
+            FILE *fp2;
+            string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
+            fp2 = fopen(log_dir.c_str(),"w");
+            fprintf(fp2,"time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree size st, tree size end, add point size, preprocess time\n");
+            for (int i = 0;i<time_log_counter; i++){
+                fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot8[i]), int(s_plot10[i]), s_plot11[i]);
+                t.push_back(T1[i]);
+                s_vec.push_back(s_plot9[i]);
+                s_vec2.push_back(s_plot3[i] + s_plot6[i]);
+                s_vec3.push_back(s_plot4[i]);
+                s_vec5.push_back(s_plot[i]);
+            }
+            fclose(fp2);
+        }
+}
+
+void LaserMappingNode::timer_callback()
+{
         if(sync_packages(Measures))
         {
             if (flg_first_scan)
@@ -1107,13 +1147,13 @@ private:
         }
     }
 
-    void map_publish_callback()
-    {
+void LaserMappingNode::map_publish_callback()
+{
         if (map_pub_en) publish_map(pubLaserCloudMap_);
     }
 
-    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
-    {
+void LaserMappingNode::map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
+{
         RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
         if (pcd_save_en)
         {
@@ -1128,71 +1168,8 @@ private:
         }
     }
 
-private:
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
-    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
-    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
-    rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+}  // namespace fast_lio
 
-    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
-    rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::TimerBase::SharedPtr map_pub_timer_;
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+#include "rclcpp_components/register_node_macro.hpp"
 
-    bool effect_pub_en = false, map_pub_en = false;
-    int effect_feat_num = 0, frame_num = 0;
-    double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
-    bool flg_EKF_converged, EKF_stop_flg = 0;
-    double epsi[23] = {0.001};
-
-    FILE *fp;
-    ofstream fout_pre, fout_out, fout_dbg;
-};
-
-int main(int argc, char** argv)
-{
-    rclcpp::init(argc, argv);
-
-    signal(SIGINT, SigHandle);
-
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
-
-    if (rclcpp::ok())
-        rclcpp::shutdown();
-    /**************** save map ****************/
-    /* 1. make sure you have enough memories
-    /* 2. pcd save will largely influence the real-time performences **/
-    if (pcl_wait_save->size() > 0 && pcd_save_en)
-    {
-        string file_name = string("scans.pcd");
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
-        pcl::PCDWriter pcd_writer;
-        cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
-    }
-
-    if (runtime_pos_log)
-    {
-        vector<double> t, s_vec, s_vec2, s_vec3, s_vec4, s_vec5, s_vec6, s_vec7;    
-        FILE *fp2;
-        string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
-        fp2 = fopen(log_dir.c_str(),"w");
-        fprintf(fp2,"time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree size st, tree size end, add point size, preprocess time\n");
-        for (int i = 0;i<time_log_counter; i++){
-            fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot8[i]), int(s_plot10[i]), s_plot11[i]);
-            t.push_back(T1[i]);
-            s_vec.push_back(s_plot9[i]);
-            s_vec2.push_back(s_plot3[i] + s_plot6[i]);
-            s_vec3.push_back(s_plot4[i]);
-            s_vec5.push_back(s_plot[i]);
-        }
-        fclose(fp2);
-    }
-
-    return 0;
-}
+RCLCPP_COMPONENTS_REGISTER_NODE(fast_lio::LaserMappingNode)
