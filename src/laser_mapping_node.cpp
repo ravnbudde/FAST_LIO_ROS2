@@ -37,6 +37,7 @@
 #include <math.h>
 #include <thread>
 #include <fstream>
+#include <stdexcept>
 #include <csignal>
 #include <chrono>
 #include <unistd.h>
@@ -59,7 +60,9 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
+#ifdef FAST_LIO_ENABLE_LIVOX
 #include <livox_ros_driver2/msg/custom_msg.hpp>
+#endif
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -308,6 +311,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
 double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
+#ifdef FAST_LIO_ENABLE_LIVOX
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
     mtx_buffer.lock();
@@ -346,6 +350,8 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
+
+#endif
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
@@ -922,7 +928,12 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
         {
+#ifdef FAST_LIO_ENABLE_LIVOX
             sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+#else
+            RCLCPP_FATAL(this->get_logger(), "FAST-LIO was compiled without Livox support. preprocess.lidar_type=1 (AVIA/Livox) cannot be configured at runtime. Rebuild with -DFAST_LIO_ENABLE_LIVOX=ON or use a PointCloud2 lidar_type such as Velodyne/Ouster/MID360/default.");
+            throw std::runtime_error("FAST-LIO Livox support is disabled");
+#endif
         }
         else
         {

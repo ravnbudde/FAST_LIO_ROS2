@@ -47,6 +47,8 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   ${OpenMP_C_FLAGS}")
 find_package(PythonLibs REQUIRED)
 find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
 
+option(FAST_LIO_ENABLE_LIVOX "Build Livox custom message support" ON)
+
 # ROS dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -59,7 +61,12 @@ find_package(std_srvs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
-find_package(livox_ros_driver2 REQUIRED)
+if(FAST_LIO_ENABLE_LIVOX)
+  find_package(livox_ros_driver2 REQUIRED)
+  message(STATUS "FAST-LIO Livox support: ON")
+else()
+  message(WARNING "FAST-LIO Livox support: OFF - livox_ros_driver2 will not be used and Livox lidar_type=1 will not configure at runtime")
+endif()
 find_package(rosidl_default_generators REQUIRED)
 
 set(dependencies
@@ -73,8 +80,11 @@ set(dependencies
   visualization_msgs
   pcl_ros
   pcl_conversions
-  livox_ros_driver2
 )
+
+if(FAST_LIO_ENABLE_LIVOX)
+  list(APPEND dependencies livox_ros_driver2)
+endif()
 
 # Thirdparty libraries
 find_package(Eigen3 REQUIRED)
@@ -105,6 +115,9 @@ target_include_directories(fastlio_mapping_component PUBLIC
 target_link_libraries(fastlio_mapping_component ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen)
 target_include_directories(fastlio_mapping_component PRIVATE ${PYTHON_INCLUDE_DIRS})
 ament_target_dependencies(fastlio_mapping_component ${dependencies})
+if(FAST_LIO_ENABLE_LIVOX)
+  target_compile_definitions(fastlio_mapping_component PUBLIC FAST_LIO_ENABLE_LIVOX)
+endif()
 
 add_executable(fastlio_mapping src/laser_mapping_main.cpp)
 target_link_libraries(fastlio_mapping fastlio_mapping_component)
