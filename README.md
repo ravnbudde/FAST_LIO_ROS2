@@ -71,7 +71,7 @@ ROS >= Foxy (Recommend to use ROS-Humble). [ROS Installation](https://docs.ros.o
 
 ### 1.2. **PCL && Eigen**
 PCL    >= 1.8,   Follow [PCL Installation](https://pointclouds.org/downloads/#linux).  
-Link doesnt seem to work, do (tested with distro jazzy):  
+Link doesnt seem to work, do (tested with distro jazzy, version: 2.6.4-1noble.20260615.153330):  
 ```bash
 sudo apt update
 sudo apt install ros-<distro>-pcl-ros
