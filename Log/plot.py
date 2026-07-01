@@ -1,7 +1,19 @@
-# import matplotlib
-# matplotlib.use('Agg')
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def load_required_log(path):
+    path = SCRIPT_DIR / path
+    if not path.exists() or path.stat().st_size == 0:
+        raise SystemExit(
+            f'{path} is empty. Enable runtime_pos_log_enable, rerun FAST-LIO, '
+            'then run this script again.'
+        )
+    return np.atleast_2d(np.loadtxt(path))
 
 
 #######for ikfom
@@ -9,8 +21,11 @@ fig, axs = plt.subplots(4,2)
 lab_pre = ['', 'pre-x', 'pre-y', 'pre-z']
 lab_out = ['', 'out-x', 'out-y', 'out-z']
 plot_ind = range(7,10)
-a_pre=np.loadtxt('mat_pre.txt')
-a_out=np.loadtxt('mat_out.txt')
+a_pre=load_required_log('mat_pre.txt')
+a_out=load_required_log('mat_out.txt')
+row_count = min(a_pre.shape[0], a_out.shape[0])
+a_pre = a_pre[:row_count, :]
+a_out = a_out[:row_count, :]
 time=a_pre[:,0]
 axs[0,0].set_title('Attitude')
 axs[1,0].set_title('Translation')
@@ -22,12 +37,12 @@ axs[2,1].set_title('ba')
 axs[3,1].set_title('Gravity')
 for i in range(1,4):
     for j in range(8):
-        axs[j%4, j/4].plot(time, a_pre[:,i+j*3],'.-', label=lab_pre[i])
-        axs[j%4, j/4].plot(time, a_out[:,i+j*3],'.-', label=lab_out[i])
+        axs[j % 4, j // 4].plot(time, a_pre[:,i+j*3],'.-', label=lab_pre[i])
+        axs[j % 4, j // 4].plot(time, a_out[:,i+j*3],'.-', label=lab_out[i])
 for j in range(8):
     # axs[j].set_xlim(386,389)
-    axs[j%4, j/4].grid()
-    axs[j%4, j/4].legend()
+    axs[j % 4, j // 4].grid()
+    axs[j % 4, j // 4].legend()
 plt.grid()
 #######for ikfom#######
 
