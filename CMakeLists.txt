@@ -47,7 +47,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   ${OpenMP_C_FLAGS}")
 find_package(PythonLibs REQUIRED)
 find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
 
-option(FAST_LIO_ENABLE_LIVOX "Build Livox custom message support" ON)
+option(FAST_LIO_ENABLE_LIVOX "Build Livox custom message support" OFF)
 
 # ROS dependencies
 find_package(ament_cmake REQUIRED)
@@ -65,7 +65,7 @@ if(FAST_LIO_ENABLE_LIVOX)
   find_package(livox_ros_driver2 REQUIRED)
   message(STATUS "FAST-LIO Livox support: ON")
 else()
-  message(WARNING "FAST-LIO Livox support: OFF - livox_ros_driver2 will not be used and Livox lidar_type=1 will not configure at runtime")
+  message(WARNING "FAST-LIO Livox support: OFF - livox_ros_driver2 will not be used and Livox lidar_type=1 will not configure at runtime. To enable, set FAST_LIO_ENABLE_LIVOX=ON in CMakeLists.txt and rebuild.")
 endif()
 find_package(rosidl_default_generators REQUIRED)
 
