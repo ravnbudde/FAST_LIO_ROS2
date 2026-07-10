@@ -634,14 +634,47 @@ void set_posestamp(T & out)
     
 }
 
+void set_twist(nav_msgs::msg::Odometry & out, const Eigen::Matrix<double, 23, 23> & P)
+{
+    const V3D linear_body = state_point.rot.conjugate() * state_point.vel;
+    out.twist.twist.linear.x = linear_body.x();
+    out.twist.twist.linear.y = linear_body.y();
+    out.twist.twist.linear.z = linear_body.z();
+
+    V3D angular_body = Zero3d;
+    if (!Measures.imu.empty())
+    {
+        const auto & gyro = Measures.imu.back()->angular_velocity;
+        angular_body << gyro.x, gyro.y, gyro.z;
+        angular_body -= V3D(state_point.bg[0], state_point.bg[1], state_point.bg[2]);
+    }
+    out.twist.twist.angular.x = angular_body.x();
+    out.twist.twist.angular.y = angular_body.y();
+    out.twist.twist.angular.z = angular_body.z();
+
+    out.twist.covariance.fill(0.0);
+    const M3D R_world_body = state_point.rot.toRotationMatrix();
+    const M3D linear_cov_world = P.block<3, 3>(12, 12);
+    const M3D linear_cov_body = R_world_body.transpose() * linear_cov_world * R_world_body;
+    const M3D angular_cov_body = P.block<3, 3>(15, 15);
+    for (int r = 0; r < 3; ++r)
+    {
+        for (int c = 0; c < 3; ++c)
+        {
+            out.twist.covariance[r * 6 + c] = linear_cov_body(r, c);
+            out.twist.covariance[(r + 3) * 6 + (c + 3)] = angular_cov_body(r, c);
+        }
+    }
+}
+
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
     odomAftMapped.header.frame_id = odom_frame_id;
     odomAftMapped.child_frame_id = body_frame_id;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
+    odomAftMapped.pose.covariance.fill(0.0);
     for (int i = 0; i < 6; i ++)
     {
         int k = i < 3 ? i + 3 : i - 3;
@@ -652,6 +685,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    set_twist(odomAftMapped, P);
+    pubOdomAftMapped->publish(odomAftMapped);
 
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = odom_frame_id;
