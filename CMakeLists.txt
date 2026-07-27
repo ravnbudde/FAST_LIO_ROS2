@@ -53,6 +53,7 @@ option(FAST_LIO_ENABLE_LIVOX "Build Livox custom message support" OFF)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -72,6 +73,7 @@ find_package(rosidl_default_generators REQUIRED)
 set(dependencies
   rclcpp
   rclcpp_components
+  diagnostic_msgs
   geometry_msgs
   nav_msgs
   sensor_msgs

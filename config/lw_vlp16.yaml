@@ -9,6 +9,21 @@
         runtime_pos_log_enable: false
         map_file_path: "./test.pcd"
 
+        safety:
+            enabled: true
+            max_linear_speed: 4.0
+            max_angular_speed: 3.0
+            max_linear_acceleration: 8.0
+            max_angular_acceleration: 10.0
+            max_pose_jump: 1.0
+            max_vertical_speed: 0.7
+            max_roll_pitch: 0.7
+            max_covariance_diagonal: 0.0
+            max_covariance_trace: 0.0
+            max_consecutive_rejects: 3
+            reset_cooldown_sec: 5.0
+            publish_raw_debug: false
+
         common:
             lid_topic:  "vlp16/points"
             imu_topic:  "vectornav/imu"

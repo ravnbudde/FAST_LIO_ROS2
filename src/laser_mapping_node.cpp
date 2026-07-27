@@ -33,8 +33,13 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
-#include <mutex>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <math.h>
+#include <memory>
+#include <mutex>
+#include <sstream>
 #include <thread>
 #include <fstream>
 #include <stdexcept>
@@ -46,6 +51,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
 #include "IMU_Processing.hpp"
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -126,7 +132,7 @@ PointCloudXYZI::Ptr _featsArray;
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
 
-KD_TREE<PointType> ikdtree;
+std::unique_ptr<KD_TREE<PointType>> ikdtree(new KD_TREE<PointType>());
 
 V3F XAxisPoint_body(LIDAR_SP_LEN, 0.0, 0.0);
 V3F XAxisPoint_world(LIDAR_SP_LEN, 0.0, 0.0);
@@ -232,7 +238,7 @@ void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
 void points_cache_collect()
 {
     PointVector points_history;
-    ikdtree.acquire_removed_points(points_history);
+    ikdtree->acquire_removed_points(points_history);
     // for (int i = 0; i < points_history.size(); i++) _featsArray->push_back(points_history[i]);
 }
 
@@ -282,7 +288,7 @@ void lasermap_fov_segment()
 
     points_cache_collect();
     double delete_begin = omp_get_wtime();
-    if(cub_needrm.size() > 0) kdtree_delete_counter = ikdtree.Delete_Point_Boxes(cub_needrm);
+    if(cub_needrm.size() > 0) kdtree_delete_counter = ikdtree->Delete_Point_Boxes(cub_needrm);
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
@@ -487,8 +493,8 @@ void map_incremental()
     }
 
     double st_time = omp_get_wtime();
-    add_point_size = ikdtree.Add_Points(PointToAdd, true);
-    ikdtree.Add_Points(PointNoNeedDownsample, false); 
+    add_point_size = ikdtree->Add_Points(PointToAdd, true);
+    ikdtree->Add_Points(PointNoNeedDownsample, false); 
     add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     kdtree_incremental_time = omp_get_wtime() - st_time;
 }
@@ -627,11 +633,24 @@ void set_posestamp(T & out)
     out.pose.position.x = state_point.pos(0);
     out.pose.position.y = state_point.pos(1);
     out.pose.position.z = state_point.pos(2);
-    out.pose.orientation.x = geoQuat.x;
-    out.pose.orientation.y = geoQuat.y;
-    out.pose.orientation.z = geoQuat.z;
-    out.pose.orientation.w = geoQuat.w;
+    out.pose.orientation.x = state_point.rot.coeffs()[0];
+    out.pose.orientation.y = state_point.rot.coeffs()[1];
+    out.pose.orientation.z = state_point.rot.coeffs()[2];
+    out.pose.orientation.w = state_point.rot.coeffs()[3];
     
+}
+
+
+V3D currentAngularVelocityBody()
+{
+    V3D angular_body = Zero3d;
+    if (!Measures.imu.empty())
+    {
+        const auto & gyro = Measures.imu.back()->angular_velocity;
+        angular_body << gyro.x, gyro.y, gyro.z;
+        angular_body -= V3D(state_point.bg[0], state_point.bg[1], state_point.bg[2]);
+    }
+    return angular_body;
 }
 
 void set_twist(nav_msgs::msg::Odometry & out, const Eigen::Matrix<double, 23, 23> & P)
@@ -641,13 +660,7 @@ void set_twist(nav_msgs::msg::Odometry & out, const Eigen::Matrix<double, 23, 23
     out.twist.twist.linear.y = linear_body.y();
     out.twist.twist.linear.z = linear_body.z();
 
-    V3D angular_body = Zero3d;
-    if (!Measures.imu.empty())
-    {
-        const auto & gyro = Measures.imu.back()->angular_velocity;
-        angular_body << gyro.x, gyro.y, gyro.z;
-        angular_body -= V3D(state_point.bg[0], state_point.bg[1], state_point.bg[2]);
-    }
+    const V3D angular_body = currentAngularVelocityBody();
     out.twist.twist.angular.x = angular_body.x();
     out.twist.twist.angular.y = angular_body.y();
     out.twist.twist.angular.z = angular_body.z();
@@ -667,25 +680,30 @@ void set_twist(nav_msgs::msg::Odometry & out, const Eigen::Matrix<double, 23, 23
     }
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+void fill_odometry(nav_msgs::msg::Odometry & out)
 {
-    odomAftMapped.header.frame_id = odom_frame_id;
-    odomAftMapped.child_frame_id = body_frame_id;
-    odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
-    set_posestamp(odomAftMapped.pose);
+    out.header.frame_id = odom_frame_id;
+    out.child_frame_id = body_frame_id;
+    out.header.stamp = get_ros_time(lidar_end_time);
+    set_posestamp(out.pose);
     auto P = kf.get_P();
-    odomAftMapped.pose.covariance.fill(0.0);
+    out.pose.covariance.fill(0.0);
     for (int i = 0; i < 6; i ++)
     {
         int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
+        out.pose.covariance[i*6 + 0] = P(k, 3);
+        out.pose.covariance[i*6 + 1] = P(k, 4);
+        out.pose.covariance[i*6 + 2] = P(k, 5);
+        out.pose.covariance[i*6 + 3] = P(k, 0);
+        out.pose.covariance[i*6 + 4] = P(k, 1);
+        out.pose.covariance[i*6 + 5] = P(k, 2);
     }
-    set_twist(odomAftMapped, P);
+    set_twist(out, P);
+}
+
+void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+{
+    fill_odometry(odomAftMapped);
     pubOdomAftMapped->publish(odomAftMapped);
 
     geometry_msgs::msg::TransformStamped trans;
@@ -752,7 +770,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         if (ekfom_data.converge)
         {
             /** Find the closest surfaces in the map **/
-            ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+            ikdtree->Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
             point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true;
         }
 
@@ -844,6 +862,264 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 namespace fast_lio
 {
 
+namespace
+{
+
+using GuardCovariance = esekfom::esekf<state_ikfom, 12, input_ikfom>::cov;
+
+bool isFinite(double value)
+{
+    return std::isfinite(value);
+}
+
+bool isFiniteVector(const V3D & value)
+{
+    return isFinite(value.x()) && isFinite(value.y()) && isFinite(value.z());
+}
+
+bool isFiniteMatrix(const M3D & value)
+{
+    for (int r = 0; r < value.rows(); ++r)
+    {
+        for (int c = 0; c < value.cols(); ++c)
+        {
+            if (!isFinite(value(r, c))) return false;
+        }
+    }
+    return true;
+}
+
+bool isFiniteCovariance(const GuardCovariance & value)
+{
+    for (int r = 0; r < value.rows(); ++r)
+    {
+        for (int c = 0; c < value.cols(); ++c)
+        {
+            if (!isFinite(value(r, c))) return false;
+        }
+    }
+    return true;
+}
+
+bool exceeds(double value, double limit)
+{
+    return limit > 0.0 && value > limit;
+}
+
+std::string describeLimit(const std::string & name, double value, double limit)
+{
+    std::ostringstream out;
+    out << name << " " << value << " exceeds " << limit;
+    return out.str();
+}
+
+
+}  // namespace
+
+class FastLioEstimateGuard
+{
+public:
+    struct Result
+    {
+        bool accepted = true;
+        bool reset_required = false;
+        std::string reason;
+        int consecutive_rejects = 0;
+    };
+
+    explicit FastLioEstimateGuard(rclcpp::Node & node)
+    {
+        node.declare_parameter<bool>("safety.enabled", true);
+        node.declare_parameter<double>("safety.max_linear_speed", 4.0);
+        node.declare_parameter<double>("safety.max_angular_speed", 3.0);
+        node.declare_parameter<double>("safety.max_linear_acceleration", 8.0);
+        node.declare_parameter<double>("safety.max_angular_acceleration", 10.0);
+        node.declare_parameter<double>("safety.max_pose_jump", 1.0);
+        node.declare_parameter<double>("safety.max_vertical_speed", 0.7);
+        node.declare_parameter<double>("safety.max_roll_pitch", 0.7);
+        node.declare_parameter<double>("safety.max_covariance_diagonal", 0.0);
+        node.declare_parameter<double>("safety.max_covariance_trace", 0.0);
+        node.declare_parameter<int>("safety.max_consecutive_rejects", 3);
+        node.declare_parameter<double>("safety.reset_cooldown_sec", 5.0);
+        node.declare_parameter<bool>("safety.publish_raw_debug", false);
+
+        node.get_parameter_or("safety.enabled", enabled_, true);
+        node.get_parameter_or("safety.max_linear_speed", max_linear_speed_, 4.0);
+        node.get_parameter_or("safety.max_angular_speed", max_angular_speed_, 3.0);
+        node.get_parameter_or("safety.max_linear_acceleration", max_linear_acceleration_, 8.0);
+        node.get_parameter_or("safety.max_angular_acceleration", max_angular_acceleration_, 10.0);
+        node.get_parameter_or("safety.max_pose_jump", max_pose_jump_, 1.0);
+        node.get_parameter_or("safety.max_vertical_speed", max_vertical_speed_, 0.7);
+        node.get_parameter_or("safety.max_roll_pitch", max_roll_pitch_, 0.7);
+        node.get_parameter_or("safety.max_covariance_diagonal", max_covariance_diagonal_, 0.0);
+        node.get_parameter_or("safety.max_covariance_trace", max_covariance_trace_, 0.0);
+        node.get_parameter_or("safety.max_consecutive_rejects", max_consecutive_rejects_, 3);
+        node.get_parameter_or("safety.reset_cooldown_sec", reset_cooldown_sec_, 5.0);
+        node.get_parameter_or("safety.publish_raw_debug", publish_raw_debug_, false);
+        max_consecutive_rejects_ = std::max(1, max_consecutive_rejects_);
+        reset_cooldown_sec_ = std::max(0.0, reset_cooldown_sec_);
+    }
+
+    Result validate(
+        double stamp, const state_ikfom & state, const GuardCovariance & covariance,
+        const V3D & linear_body, const V3D & angular_body)
+    {
+        if (!enabled_)
+        {
+            return Result{};
+        }
+
+        std::string reason;
+        const V3D euler = SO3ToEuler(state.rot);
+        const M3D rot = state.rot.toRotationMatrix();
+        if (!isFiniteVector(state.pos) || !isFiniteVector(state.vel) || !isFiniteVector(linear_body) ||
+            !isFiniteVector(angular_body) || !isFiniteVector(euler) || !isFiniteMatrix(rot) ||
+            !isFiniteCovariance(covariance))
+        {
+            reason = "non-finite estimate";
+        }
+        else if (exceeds(linear_body.norm(), max_linear_speed_))
+        {
+            reason = describeLimit("linear speed", linear_body.norm(), max_linear_speed_);
+        }
+        else if (exceeds(angular_body.norm(), max_angular_speed_))
+        {
+            reason = describeLimit("angular speed", angular_body.norm(), max_angular_speed_);
+        }
+        else if (exceeds(std::abs(state.vel.z()), max_vertical_speed_))
+        {
+            reason = describeLimit("vertical speed", std::abs(state.vel.z()), max_vertical_speed_);
+        }
+        else if (exceeds(std::max(std::abs(euler.x()), std::abs(euler.y())), max_roll_pitch_))
+        {
+            reason = describeLimit("roll/pitch", std::max(std::abs(euler.x()), std::abs(euler.y())), max_roll_pitch_);
+        }
+        else if (exceeds(maxCovarianceDiagonal(covariance), max_covariance_diagonal_))
+        {
+            reason = describeLimit("covariance diagonal", maxCovarianceDiagonal(covariance), max_covariance_diagonal_);
+        }
+        else if (exceeds(covariance.trace(), max_covariance_trace_))
+        {
+            reason = describeLimit("covariance trace", covariance.trace(), max_covariance_trace_);
+        }
+        else if (has_last_accepted_)
+        {
+            const double dt = stamp - last_stamp_;
+            if (dt > 1.0e-3)
+            {
+                const double pose_jump = (state.pos - last_position_).norm();
+                const double linear_accel = (linear_body - last_linear_body_).norm() / dt;
+                const double angular_accel = (angular_body - last_angular_body_).norm() / dt;
+                if (exceeds(pose_jump, max_pose_jump_))
+                {
+                    reason = describeLimit("pose jump", pose_jump, max_pose_jump_);
+                }
+                else if (exceeds(linear_accel, max_linear_acceleration_))
+                {
+                    reason = describeLimit("linear acceleration", linear_accel, max_linear_acceleration_);
+                }
+                else if (exceeds(angular_accel, max_angular_acceleration_))
+                {
+                    reason = describeLimit("angular acceleration", angular_accel, max_angular_acceleration_);
+                }
+            }
+        }
+
+        if (reason.empty())
+        {
+            consecutive_rejects_ = 0;
+            return Result{};
+        }
+
+        ++consecutive_rejects_;
+        Result result;
+        result.accepted = false;
+        result.reason = reason;
+        result.consecutive_rejects = consecutive_rejects_;
+        if (consecutive_rejects_ >= max_consecutive_rejects_ && resetCooldownElapsed(stamp))
+        {
+            last_reset_request_stamp_ = stamp;
+            result.reset_required = true;
+        }
+        return result;
+    }
+
+    void recordAccepted(
+        double stamp, const state_ikfom & state, const GuardCovariance & covariance,
+        const V3D & linear_body, const V3D & angular_body)
+    {
+        last_stamp_ = stamp;
+        last_position_ = state.pos;
+        last_linear_body_ = linear_body;
+        last_angular_body_ = angular_body;
+        last_state_ = state;
+        last_covariance_ = covariance;
+        has_last_accepted_ = true;
+        consecutive_rejects_ = 0;
+    }
+
+    bool hasAcceptedEstimate() const { return has_last_accepted_; }
+    const state_ikfom & lastAcceptedState() const { return last_state_; }
+    const GuardCovariance & lastAcceptedCovariance() const { return last_covariance_; }
+    bool publishRawDebug() const { return publish_raw_debug_; }
+    int consecutiveRejects() const { return consecutive_rejects_; }
+
+    void reset()
+    {
+        has_last_accepted_ = false;
+        consecutive_rejects_ = 0;
+        last_stamp_ = 0.0;
+        last_position_ = Zero3d;
+        last_linear_body_ = Zero3d;
+        last_angular_body_ = Zero3d;
+        last_state_ = state_ikfom();
+        last_covariance_ = GuardCovariance::Identity();
+    }
+
+private:
+    static double maxCovarianceDiagonal(const GuardCovariance & covariance)
+    {
+        double max_value = 0.0;
+        for (int i = 0; i < covariance.rows(); ++i)
+        {
+            max_value = std::max(max_value, std::abs(covariance(i, i)));
+        }
+        return max_value;
+    }
+
+    bool resetCooldownElapsed(double stamp) const
+    {
+        if (last_reset_request_stamp_ < 0.0 || stamp <= 0.0)
+        {
+            return true;
+        }
+        return stamp - last_reset_request_stamp_ >= reset_cooldown_sec_;
+    }
+
+    bool enabled_ = true;
+    bool publish_raw_debug_ = false;
+    int max_consecutive_rejects_ = 3;
+    double max_linear_speed_ = 4.0;
+    double max_angular_speed_ = 3.0;
+    double max_linear_acceleration_ = 8.0;
+    double max_angular_acceleration_ = 10.0;
+    double max_pose_jump_ = 1.0;
+    double max_vertical_speed_ = 0.7;
+    double max_roll_pitch_ = 0.7;
+    double max_covariance_diagonal_ = 0.0;
+    double max_covariance_trace_ = 0.0;
+    double reset_cooldown_sec_ = 5.0;
+    double last_reset_request_stamp_ = -1.0;
+    bool has_last_accepted_ = false;
+    int consecutive_rejects_ = 0;
+    double last_stamp_ = 0.0;
+    V3D last_position_ = Zero3d;
+    V3D last_linear_body_ = Zero3d;
+    V3D last_angular_body_ = Zero3d;
+    state_ikfom last_state_;
+    GuardCovariance last_covariance_ = GuardCovariance::Identity();
+};
+
 LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("laser_mapping", options)
 {
         this->declare_parameter<bool>("publish.path_en", true);
@@ -884,6 +1160,9 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+
+        estimate_guard_ = std::make_unique<FastLioEstimateGuard>(*this);
+        safety_publish_raw_debug_ = estimate_guard_->publishRawDebug();
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -991,7 +1270,12 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+        if (safety_publish_raw_debug_)
+        {
+            pubRawOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry/raw", 20);
+        }
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        pubSlamHealth_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("~/health", 10);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         //------------------------------------------------------------------------------------------------------
@@ -1002,7 +1286,9 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+        reset_mapping_srv_ = this->create_service<std_srvs::srv::Trigger>("~/reset_mapping", std::bind(&LaserMappingNode::reset_mapping_callback, this, std::placeholders::_1, std::placeholders::_2));
 
+        publish_slam_health(diagnostic_msgs::msg::DiagnosticStatus::STALE, "UNINITIALIZED", "waiting for first accepted Fast-LIO estimate");
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
@@ -1054,6 +1340,22 @@ void LaserMappingNode::write_runtime_outputs()
 
 void LaserMappingNode::timer_callback()
 {
+        std::string reset_reason;
+        {
+            std::lock_guard<std::mutex> lock(reset_mutex_);
+            if (reset_requested_)
+            {
+                reset_reason = reset_reason_;
+                reset_requested_ = false;
+                reset_reason_.clear();
+            }
+        }
+        if (!reset_reason.empty())
+        {
+            perform_mapping_reset(reset_reason);
+            return;
+        }
+
         if(sync_packages(Measures))
         {
             if (flg_first_scan)
@@ -1077,6 +1379,36 @@ void LaserMappingNode::timer_callback()
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
+            const auto predicted_covariance = kf.get_P();
+            const V3D predicted_linear_body = state_point.rot.conjugate() * state_point.vel;
+            const V3D predicted_angular_body = currentAngularVelocityBody();
+            const auto predicted_validation = estimate_guard_->validate(
+                lidar_end_time, state_point, predicted_covariance, predicted_linear_body, predicted_angular_body);
+            if (!predicted_validation.accepted)
+            {
+                if (safety_publish_raw_debug_) publish_raw_odometry();
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 1000,
+                    "Rejected Fast-LIO predicted estimate: %s", predicted_validation.reason.c_str());
+                if (estimate_guard_->hasAcceptedEstimate())
+                {
+                    state_ikfom accepted_state = estimate_guard_->lastAcceptedState();
+                    auto accepted_covariance = estimate_guard_->lastAcceptedCovariance();
+                    kf.change_x(accepted_state);
+                    kf.change_P(accepted_covariance);
+                    state_point = kf.get_x();
+                    pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                }
+                if (!estimate_guard_->hasAcceptedEstimate() || predicted_validation.reset_required)
+                {
+                    request_mapping_reset("rejected predicted estimate: " + predicted_validation.reason);
+                }
+                publish_slam_health(
+                    diagnostic_msgs::msg::DiagnosticStatus::WARN, "REJECTING",
+                    "rejected predicted estimate: " + predicted_validation.reason);
+                return;
+            }
+
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
@@ -1094,23 +1426,23 @@ void LaserMappingNode::timer_callback()
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
             /*** initialize the map kdtree ***/
-            if(ikdtree.Root_Node == nullptr)
+            if(ikdtree->Root_Node == nullptr)
             {
                 RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
                 if(feats_down_size > 5)
                 {
-                    ikdtree.set_downsample_param(filter_size_map_min);
+                    ikdtree->set_downsample_param(filter_size_map_min);
                     feats_down_world->resize(feats_down_size);
                     for(int i = 0; i < feats_down_size; i++)
                     {
                         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
                     }
-                    ikdtree.Build(feats_down_world->points);
+                    ikdtree->Build(feats_down_world->points);
                 }
                 return;
             }
-            int featsFromMapNum = ikdtree.validnum();
-            kdtree_size_st = ikdtree.size();
+            int featsFromMapNum = ikdtree->validnum();
+            kdtree_size_st = ikdtree->size();
             
             // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
 
@@ -1130,10 +1462,10 @@ void LaserMappingNode::timer_callback()
 
             if(0) // If you need to see map point, change to "if(1)"
             {
-                PointVector ().swap(ikdtree.PCL_Storage);
-                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                PointVector ().swap(ikdtree->PCL_Storage);
+                ikdtree->flatten(ikdtree->Root_Node, ikdtree->PCL_Storage, NOT_RECORD);
                 featsFromMap->clear();
-                featsFromMap->points = ikdtree.PCL_Storage;
+                featsFromMap->points = ikdtree->PCL_Storage;
             }
 
             pointSearchInd_surf.resize(feats_down_size);
@@ -1157,6 +1489,40 @@ void LaserMappingNode::timer_callback()
 
             double t_update_end = omp_get_wtime();
 
+            const auto updated_covariance = kf.get_P();
+            const V3D updated_linear_body = state_point.rot.conjugate() * state_point.vel;
+            const V3D updated_angular_body = currentAngularVelocityBody();
+            const auto updated_validation = estimate_guard_->validate(
+                lidar_end_time, state_point, updated_covariance, updated_linear_body, updated_angular_body);
+            if (!updated_validation.accepted)
+            {
+                if (safety_publish_raw_debug_) publish_raw_odometry();
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 1000,
+                    "Rejected Fast-LIO updated estimate: %s", updated_validation.reason.c_str());
+                if (estimate_guard_->hasAcceptedEstimate())
+                {
+                    state_ikfom accepted_state = estimate_guard_->lastAcceptedState();
+                    auto accepted_covariance = estimate_guard_->lastAcceptedCovariance();
+                    kf.change_x(accepted_state);
+                    kf.change_P(accepted_covariance);
+                    state_point = kf.get_x();
+                    euler_cur = SO3ToEuler(state_point.rot);
+                    pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                }
+                if (!estimate_guard_->hasAcceptedEstimate() || updated_validation.reset_required)
+                {
+                    request_mapping_reset("rejected updated estimate: " + updated_validation.reason);
+                }
+                publish_slam_health(
+                    diagnostic_msgs::msg::DiagnosticStatus::WARN, "REJECTING",
+                    "rejected updated estimate: " + updated_validation.reason);
+                return;
+            }
+            estimate_guard_->recordAccepted(
+                lidar_end_time, state_point, updated_covariance, updated_linear_body, updated_angular_body);
+            publish_slam_health(diagnostic_msgs::msg::DiagnosticStatus::OK, "OK", "Fast-LIO estimate accepted");
+
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
@@ -1176,7 +1542,7 @@ void LaserMappingNode::timer_callback()
             if (runtime_pos_log)
             {
                 frame_num ++;
-                kdtree_size_end = ikdtree.size();
+                kdtree_size_end = ikdtree->size();
                 aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t5 - t0) / frame_num;
                 aver_time_icp = aver_time_icp * (frame_num - 1)/frame_num + (t_update_end - t_update_start) / frame_num;
                 aver_time_match = aver_time_match * (frame_num - 1)/frame_num + (match_time)/frame_num;
@@ -1202,6 +1568,137 @@ void LaserMappingNode::timer_callback()
                 dump_lio_state_to_log(fp);
             }
         }
+    }
+
+void LaserMappingNode::reset_mapping_callback(
+    std_srvs::srv::Trigger::Request::ConstSharedPtr /*req*/,
+    std_srvs::srv::Trigger::Response::SharedPtr res)
+{
+        request_mapping_reset("manual reset_mapping service call");
+        res->success = true;
+        res->message = "Fast-LIO mapping reset requested.";
+    }
+
+void LaserMappingNode::request_mapping_reset(const std::string & reason)
+{
+        std::lock_guard<std::mutex> lock(reset_mutex_);
+        reset_requested_ = true;
+        reset_reason_ = reason;
+    }
+
+void LaserMappingNode::perform_mapping_reset(const std::string & reason)
+{
+        RCLCPP_ERROR(this->get_logger(), "Resetting Fast-LIO mapping: %s", reason.c_str());
+        publish_slam_health(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "RESETTING", reason);
+
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            lidar_buffer.clear();
+            time_buffer.clear();
+            imu_buffer.clear();
+        }
+
+        Measures = MeasureGroup();
+        Measures.lidar_end_time = 0.0;
+        lidar_pushed = false;
+        flg_first_scan = true;
+        flg_EKF_inited = false;
+        is_first_lidar = true;
+        Localmap_Initialized = false;
+        first_lidar_time = 0.0;
+        lidar_end_time = 0.0;
+        last_timestamp_lidar = 0.0;
+        last_timestamp_imu = -1.0;
+        lidar_mean_scantime = 0.0;
+        scan_num = 0;
+        publish_count = 0;
+        process_increments = 0;
+        total_distance = 0.0;
+        kdtree_incremental_time = 0.0;
+        kdtree_search_time = 0.0;
+        kdtree_delete_time = 0.0;
+        kdtree_size_st = 0;
+        kdtree_size_end = 0;
+        add_point_size = 0;
+        kdtree_delete_counter = 0;
+        cub_needrm.clear();
+        pointSearchInd_surf.clear();
+        Nearest_Points.clear();
+        path.poses.clear();
+        path.header.frame_id = odom_frame_id;
+        path.header.stamp = this->get_clock()->now();
+        featsFromMap->clear();
+        feats_undistort->clear();
+        feats_down_body->clear();
+        feats_down_world->clear();
+        laserCloudOri->clear();
+        corr_normvect->clear();
+        pcl_wait_pub->clear();
+        pcl_wait_save->clear();
+        _featsArray.reset(new PointCloudXYZI());
+
+        ikdtree = std::make_unique<KD_TREE<PointType>>();
+        ikdtree->set_downsample_param(filter_size_map_min);
+
+        p_imu->Reset();
+        p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
+        p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
+        p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
+        p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
+        p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+
+        state_ikfom reset_state;
+        GuardCovariance reset_covariance = GuardCovariance::Identity();
+        kf.change_x(reset_state);
+        kf.change_P(reset_covariance);
+        fill(epsi, epsi + 23, 0.001);
+        kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+        state_point = kf.get_x();
+        euler_cur = SO3ToEuler(state_point.rot);
+        pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+        geoQuat.x = state_point.rot.coeffs()[0];
+        geoQuat.y = state_point.rot.coeffs()[1];
+        geoQuat.z = state_point.rot.coeffs()[2];
+        geoQuat.w = state_point.rot.coeffs()[3];
+        estimate_guard_->reset();
+
+        publish_slam_health(
+            diagnostic_msgs::msg::DiagnosticStatus::STALE, "UNINITIALIZED",
+            "Fast-LIO reset complete; waiting for first accepted estimate");
+    }
+
+void LaserMappingNode::publish_slam_health(
+    unsigned char level, const std::string & state, const std::string & message)
+{
+        if (!pubSlamHealth_) return;
+        diagnostic_msgs::msg::DiagnosticArray diagnostics;
+        diagnostics.header.stamp = this->get_clock()->now();
+        diagnostic_msgs::msg::DiagnosticStatus status;
+        status.level = level;
+        status.name = this->get_fully_qualified_name() + std::string("/estimate_guard");
+        status.hardware_id = body_frame_id;
+        status.message = state + ": " + message;
+
+        diagnostic_msgs::msg::KeyValue rejects;
+        rejects.key = "consecutive_rejects";
+        rejects.value = estimate_guard_ ? std::to_string(estimate_guard_->consecutiveRejects()) : "0";
+        status.values.push_back(rejects);
+
+        diagnostic_msgs::msg::KeyValue reason;
+        reason.key = "reason";
+        reason.value = message;
+        status.values.push_back(reason);
+
+        diagnostics.status.push_back(status);
+        pubSlamHealth_->publish(diagnostics);
+    }
+
+void LaserMappingNode::publish_raw_odometry()
+{
+        if (!pubRawOdomAftMapped_) return;
+        nav_msgs::msg::Odometry raw;
+        fill_odometry(raw);
+        pubRawOdomAftMapped_->publish(raw);
     }
 
 void LaserMappingNode::map_publish_callback()

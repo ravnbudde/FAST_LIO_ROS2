@@ -53,6 +53,14 @@ ros2 launch fast_lio mapping.launch.py config_file:=lw_vlp16.yaml
 ros2 launch fast_lio mapping_composed.launch.py config_file:=lw_vlp16.yaml
 ```
 
+## Estimate Safety Guard
+
+`fast_lio::LaserMappingNode` validates each estimate before publishing odometry, publishing registered clouds, or inserting the scan into the local map. The guard rejects non-finite estimates and configurable motion spikes such as excessive velocity, acceleration, vertical motion, roll/pitch, or pose jumps. Rejected estimates are not published on `/Odometry` and do not update the internal map.
+
+Safety parameters live under `safety.*` in the Fast-LIO YAML config. The defaults are intentionally conservative and should be tuned from logs if normal operation triggers rejections. Set `safety.publish_raw_debug: true` to publish rejected candidate odometry on `/Odometry/raw` for diagnosis.
+
+Recovery is available through `~/reset_mapping` (`std_srvs/srv/Trigger`). The same reset path is requested automatically after `safety.max_consecutive_rejects` rejected estimates. Reset clears buffered sensor data, the local Fast-LIO map, path/cloud accumulators, IMU preprocessing state, and EKF state, then waits for a fresh initialization. Health is published on `~/health` as `diagnostic_msgs/msg/DiagnosticArray`.
+
 ## Full Stack Usage
 
 The preferred full SLAM path is through the parent bringup package:
