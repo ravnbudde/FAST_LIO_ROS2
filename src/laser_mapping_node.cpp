@@ -34,6 +34,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <math.h>
@@ -50,6 +51,7 @@
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include "IMU_Processing.hpp"
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -63,7 +65,10 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <tf2/exceptions.h>
+#include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #ifdef FAST_LIO_ENABLE_LIVOX
@@ -96,8 +101,14 @@ condition_variable sig_buffer;
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
 string odom_frame_id = "camera_init";
-string body_frame_id = "body";
+string imu_frame_id = "imu";
+string lidar_frame_id = "lidar";
+string observed_lidar_frame_id;
+string observed_imu_frame_id;
 bool enable_tf = true;
+bool get_sensor_frames_from_msgs = false;
+bool get_extrinsic_from_tf = false;
+std::atomic_bool sensor_setup_ready_for_processing{false};
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -295,6 +306,16 @@ void lasermap_fov_segment()
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
     mtx_buffer.lock();
+    if (get_sensor_frames_from_msgs && observed_lidar_frame_id.empty() &&
+        !msg->header.frame_id.empty())
+    {
+        observed_lidar_frame_id = msg->header.frame_id;
+    }
+    if (!sensor_setup_ready_for_processing.load())
+    {
+        mtx_buffer.unlock();
+        return;
+    }
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
@@ -324,6 +345,16 @@ bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
     mtx_buffer.lock();
+    if (get_sensor_frames_from_msgs && observed_lidar_frame_id.empty() &&
+        !msg->header.frame_id.empty())
+    {
+        observed_lidar_frame_id = msg->header.frame_id;
+    }
+    if (!sensor_setup_ready_for_processing.load())
+    {
+        mtx_buffer.unlock();
+        return;
+    }
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
@@ -379,6 +410,17 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     double timestamp = get_time_sec(msg->header.stamp);
 
     mtx_buffer.lock();
+
+    if (get_sensor_frames_from_msgs && observed_imu_frame_id.empty() &&
+        !msg->header.frame_id.empty())
+    {
+        observed_imu_frame_id = msg->header.frame_id;
+    }
+    if (!sensor_setup_ready_for_processing.load())
+    {
+        mtx_buffer.unlock();
+        return;
+    }
 
     if (timestamp < last_timestamp_imu)
     {
@@ -572,7 +614,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = body_frame_id;
+    laserCloudmsg.header.frame_id = imu_frame_id;
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -683,7 +725,7 @@ void set_twist(nav_msgs::msg::Odometry & out, const Eigen::Matrix<double, 23, 23
 void fill_odometry(nav_msgs::msg::Odometry & out)
 {
     out.header.frame_id = odom_frame_id;
-    out.child_frame_id = body_frame_id;
+    out.child_frame_id = imu_frame_id;
     out.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(out.pose);
     auto P = kf.get_P();
@@ -709,7 +751,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = odom_frame_id;
     trans.header.stamp = odomAftMapped.header.stamp;
-    trans.child_frame_id = body_frame_id;
+    trans.child_frame_id = imu_frame_id;
     trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
     trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
     trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
@@ -1129,7 +1171,8 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
         this->declare_parameter<string>("odom_frame_id", "camera_init");
-        this->declare_parameter<string>("body_frame_id", "body");
+        this->declare_parameter<string>("imu_frame_id", "imu");
+        this->declare_parameter<string>("lidar_frame_id", "lidar");
         this->declare_parameter<bool>("enable_tf", true);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
@@ -1137,6 +1180,7 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
+        this->declare_parameter<bool>("common.get_sensor_frames_from_msgs", false);
         this->declare_parameter<double>("filter_size_corner", 0.5);
         this->declare_parameter<double>("filter_size_surf", 0.5);
         this->declare_parameter<double>("filter_size_map", 0.5);
@@ -1156,6 +1200,7 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         this->declare_parameter<bool>("feature_extract_enable", false);
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
+        this->declare_parameter<bool>("mapping.get_extrinsic_from_tf", false);
         this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
@@ -1171,7 +1216,8 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
         this->get_parameter_or<string>("odom_frame_id", odom_frame_id, "camera_init");
-        this->get_parameter_or<string>("body_frame_id", body_frame_id, "body");
+        this->get_parameter_or<string>("imu_frame_id", imu_frame_id, "imu");
+        this->get_parameter_or<string>("lidar_frame_id", lidar_frame_id, "lidar");
         this->get_parameter_or<bool>("enable_tf", enable_tf, true);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
@@ -1179,6 +1225,8 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
+        this->get_parameter_or<bool>(
+            "common.get_sensor_frames_from_msgs", get_sensor_frames_from_msgs, false);
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
         this->get_parameter_or<double>("filter_size_surf",filter_size_surf_min,0.5);
         this->get_parameter_or<double>("filter_size_map",filter_size_map_min,0.5);
@@ -1198,10 +1246,18 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
+        this->get_parameter_or<bool>(
+            "mapping.get_extrinsic_from_tf", get_extrinsic_from_tf, false);
         this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            observed_lidar_frame_id.clear();
+            observed_imu_frame_id.clear();
+        }
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -1225,9 +1281,19 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         memset(point_selected_surf, true, sizeof(point_selected_surf));
         memset(res_last, -1000.0f, sizeof(res_last));
 
-        Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
-        Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
-        p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
+        if (!get_extrinsic_from_tf)
+        {
+            if (extrinT.size() != 3 || extrinR.size() != 9)
+            {
+                throw std::invalid_argument(
+                    "mapping.extrinsic_T must contain 3 values and "
+                    "mapping.extrinsic_R must contain 9 values when "
+                    "mapping.get_extrinsic_from_tf is false");
+            }
+            Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
+            Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
+            p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
+        }
         p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
@@ -1277,6 +1343,23 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         pubSlamHealth_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("~/health", 10);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        if (get_extrinsic_from_tf)
+        {
+            tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+            tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        }
+
+        sensor_setup_ready_ =
+            !get_sensor_frames_from_msgs && !get_extrinsic_from_tf;
+        sensor_setup_ready_for_processing.store(sensor_setup_ready_);
+        if (sensor_setup_ready_)
+        {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Using configured sensor frames and IMU<-LiDAR extrinsic: "
+                "imu='%s', lidar='%s'",
+                imu_frame_id.c_str(), lidar_frame_id.c_str());
+        }
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -1303,6 +1386,114 @@ LaserMappingNode::~LaserMappingNode()
         fclose(fp);
         fp = nullptr;
     }
+}
+
+bool LaserMappingNode::initialize_sensor_setup()
+{
+        if (sensor_setup_ready_)
+        {
+            return true;
+        }
+
+        std::string imu_frame = imu_frame_id;
+        std::string lidar_frame = lidar_frame_id;
+        if (get_sensor_frames_from_msgs)
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            imu_frame = observed_imu_frame_id;
+            lidar_frame = observed_lidar_frame_id;
+        }
+
+        if (imu_frame.empty() || lidar_frame.empty())
+        {
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(), *this->get_clock(), 2000,
+                "Waiting for sensor frame IDs (IMU: %s, LiDAR: %s)",
+                imu_frame.empty() ? "missing" : imu_frame.c_str(),
+                lidar_frame.empty() ? "missing" : lidar_frame.c_str());
+            return false;
+        }
+
+        if (imu_frame.front() == '/' || lidar_frame.front() == '/')
+        {
+            RCLCPP_ERROR_THROTTLE(
+                this->get_logger(), *this->get_clock(), 2000,
+                "Sensor frame IDs must not start with '/': imu='%s', lidar='%s'",
+                imu_frame.c_str(), lidar_frame.c_str());
+            return false;
+        }
+
+        if (get_sensor_frames_from_msgs)
+        {
+            imu_frame_id = imu_frame;
+            lidar_frame_id = lidar_frame;
+        }
+
+        if (get_extrinsic_from_tf)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (last_tf_lookup_attempt_.time_since_epoch().count() != 0 &&
+                now - last_tf_lookup_attempt_ < std::chrono::milliseconds(200))
+            {
+                return false;
+            }
+            last_tf_lookup_attempt_ = now;
+
+            try
+            {
+                // Fast-LIO expects a transform that maps LiDAR points into the
+                // IMU frame, i.e. target=IMU and source=LiDAR.
+                const auto transform = tf_buffer_->lookupTransform(
+                    imu_frame, lidar_frame, tf2::TimePointZero);
+                const auto & translation = transform.transform.translation;
+                const auto & rotation = transform.transform.rotation;
+
+                Eigen::Quaterniond quaternion(
+                    rotation.w, rotation.x, rotation.y, rotation.z);
+                const double quaternion_norm = quaternion.norm();
+                if (!std::isfinite(quaternion_norm) || quaternion_norm < 1e-9 ||
+                    !std::isfinite(translation.x) || !std::isfinite(translation.y) ||
+                    !std::isfinite(translation.z))
+                {
+                    RCLCPP_ERROR_THROTTLE(
+                        this->get_logger(), *this->get_clock(), 2000,
+                        "Invalid IMU<-LiDAR transform for imu='%s', lidar='%s'",
+                        imu_frame.c_str(), lidar_frame.c_str());
+                    return false;
+                }
+
+                quaternion.normalize();
+                Lidar_R_wrt_IMU = quaternion.toRotationMatrix();
+                Lidar_T_wrt_IMU = V3D(
+                    translation.x, translation.y, translation.z);
+                p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
+            }
+            catch (const tf2::TransformException & exception)
+            {
+                RCLCPP_INFO_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 2000,
+                    "Waiting for IMU<-LiDAR TF (imu='%s', lidar='%s'): %s",
+                    imu_frame.c_str(), lidar_frame.c_str(), exception.what());
+                return false;
+            }
+        }
+
+        sensor_setup_ready_ = true;
+        sensor_setup_ready_for_processing.store(true);
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Sensor setup ready: imu='%s', lidar='%s', extrinsic_source='%s'",
+            imu_frame_id.c_str(), lidar_frame_id.c_str(),
+            get_extrinsic_from_tf ? "tf" : "config");
+
+        // The sensor frames and their static extrinsic are immutable for this
+        // process. Stop receiving TF updates after the one-time lookup.
+        if (get_extrinsic_from_tf)
+        {
+            tf_listener_.reset();
+            tf_buffer_.reset();
+        }
+        return true;
 }
 
 void LaserMappingNode::write_runtime_outputs()
@@ -1353,6 +1544,11 @@ void LaserMappingNode::timer_callback()
         if (!reset_reason.empty())
         {
             perform_mapping_reset(reset_reason);
+            return;
+        }
+
+        if (!initialize_sensor_setup())
+        {
             return;
         }
 
@@ -1676,7 +1872,7 @@ void LaserMappingNode::publish_slam_health(
         diagnostic_msgs::msg::DiagnosticStatus status;
         status.level = level;
         status.name = this->get_fully_qualified_name() + std::string("/estimate_guard");
-        status.hardware_id = body_frame_id;
+        status.hardware_id = imu_frame_id;
         status.message = state + ": " + message;
 
         diagnostic_msgs::msg::KeyValue rejects;

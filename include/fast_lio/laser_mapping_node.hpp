@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <memory>
@@ -16,7 +17,9 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
 
 namespace fast_lio
 {
@@ -39,6 +42,7 @@ private:
     void publish_slam_health(unsigned char level, const std::string & state, const std::string & message);
     void publish_raw_odometry();
     void write_runtime_outputs();
+    bool initialize_sensor_setup();
 
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
@@ -55,6 +59,8 @@ private:
 #endif
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
@@ -63,6 +69,8 @@ private:
     std::mutex reset_mutex_;
     bool reset_requested_ = false;
     bool safety_publish_raw_debug_ = false;
+    bool sensor_setup_ready_ = false;
+    std::chrono::steady_clock::time_point last_tf_lookup_attempt_{};
     std::string reset_reason_;
 
     bool effect_pub_en = false, map_pub_en = false;

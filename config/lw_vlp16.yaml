@@ -9,6 +9,9 @@
         runtime_pos_log_enable: false
         map_file_path: "./test.pcd"
 
+        imu_frame_id: vectornav_imu_link
+        lidar_frame_id: vlp16_lidar_link
+
         safety:
             enabled: true
             max_linear_speed: 4.0
@@ -27,6 +30,7 @@
         common:
             lid_topic:  "vlp16/points"
             imu_topic:  "vectornav/imu"
+            get_sensor_frames_from_msgs: true # Resolve IMU and LiDAR frames once from the input message headers
             time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
             time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
                                         # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
@@ -39,6 +43,7 @@
             blind: 2.0
 
         mapping:
+            get_extrinsic_from_tf: true # Look up the static IMU<-LiDAR transform once before processing
             acc_cov: 0.1
             gyr_cov: 0.1
             b_acc_cov: 0.0001
