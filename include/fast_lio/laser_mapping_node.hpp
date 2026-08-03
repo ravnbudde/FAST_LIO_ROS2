@@ -75,6 +75,14 @@ private:
     bool reset_requested_ = false;
     bool full_reset_requested_ = false;
     bool checkpoint_recovering_ = false;
+    int checkpoint_recovery_attempts_ = 0;
+    int recovery_stable_accepts_ = 0;
+    int max_checkpoint_recovery_attempts_ = 3;
+    int recovery_stable_accepts_required_ = 10;
+    int recovery_checkpoint_history_size_ = 30;
+    double recovery_checkpoint_interval_sec_ = 1.0;
+    double recovery_checkpoint_min_age_sec_ = 2.0;
+    double last_recovery_checkpoint_stamp_ = -1.0;
     std::uint64_t reset_epoch_ = 0;
     bool safety_publish_raw_debug_ = false;
     bool sensor_setup_ready_ = false;

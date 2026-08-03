@@ -46,6 +46,7 @@
 #include <stdexcept>
 #include <csignal>
 #include <chrono>
+#include <deque>
 #include <unistd.h>
 #include <Python.h>
 #include <so3_math.h>
@@ -919,7 +920,7 @@ struct RecoveryCheckpoint
     V3D angular_body{Zero3d};
 };
 
-std::optional<RecoveryCheckpoint> recovery_checkpoint;
+std::deque<RecoveryCheckpoint> recovery_checkpoints;
 
 bool isFinite(double value)
 {
@@ -990,7 +991,8 @@ public:
         node.declare_parameter<double>("safety.max_angular_acceleration", 10.0);
         node.declare_parameter<double>("safety.max_pose_jump", 1.0);
         node.declare_parameter<double>("safety.max_vertical_speed", 0.7);
-        node.declare_parameter<double>("safety.max_roll_pitch", 0.7);
+        node.declare_parameter<double>("safety.max_roll_pitch_rad", 0.7);
+        node.declare_parameter<double>("safety.max_roll_pitch", -1.0);
         node.declare_parameter<double>("safety.max_covariance_diagonal", 0.0);
         node.declare_parameter<double>("safety.max_covariance_trace", 0.0);
         node.declare_parameter<int>("safety.max_consecutive_rejects", 3);
@@ -1004,7 +1006,16 @@ public:
         node.get_parameter_or("safety.max_angular_acceleration", max_angular_acceleration_, 10.0);
         node.get_parameter_or("safety.max_pose_jump", max_pose_jump_, 1.0);
         node.get_parameter_or("safety.max_vertical_speed", max_vertical_speed_, 0.7);
-        node.get_parameter_or("safety.max_roll_pitch", max_roll_pitch_, 0.7);
+        node.get_parameter_or("safety.max_roll_pitch_rad", max_roll_pitch_, 0.7);
+        double legacy_max_roll_pitch = -1.0;
+        node.get_parameter_or("safety.max_roll_pitch", legacy_max_roll_pitch, -1.0);
+        if (legacy_max_roll_pitch > 0.0)
+        {
+            max_roll_pitch_ = legacy_max_roll_pitch;
+            RCLCPP_WARN(
+                node.get_logger(),
+                "safety.max_roll_pitch is deprecated; use safety.max_roll_pitch_rad");
+        }
         node.get_parameter_or("safety.max_covariance_diagonal", max_covariance_diagonal_, 0.0);
         node.get_parameter_or("safety.max_covariance_trace", max_covariance_trace_, 0.0);
         node.get_parameter_or("safety.max_consecutive_rejects", max_consecutive_rejects_, 3);
@@ -1024,10 +1035,12 @@ public:
         }
 
         std::string reason;
-        const V3D euler = SO3ToEuler(state.rot);
+        const V3D euler_degrees = SO3ToEuler(state.rot);
+        const double max_roll_pitch_radians =
+            std::max(std::abs(euler_degrees.x()), std::abs(euler_degrees.y())) * M_PI / 180.0;
         const M3D rot = state.rot.toRotationMatrix();
         if (!isFiniteVector(state.pos) || !isFiniteVector(state.vel) || !isFiniteVector(linear_body) ||
-            !isFiniteVector(angular_body) || !isFiniteVector(euler) || !isFiniteMatrix(rot) ||
+            !isFiniteVector(angular_body) || !isFiniteVector(euler_degrees) || !isFiniteMatrix(rot) ||
             !isFiniteCovariance(covariance))
         {
             reason = "non-finite estimate";
@@ -1044,9 +1057,10 @@ public:
         {
             reason = describeLimit("vertical speed", std::abs(state.vel.z()), max_vertical_speed_);
         }
-        else if (exceeds(std::max(std::abs(euler.x()), std::abs(euler.y())), max_roll_pitch_))
+        else if (exceeds(max_roll_pitch_radians, max_roll_pitch_))
         {
-            reason = describeLimit("roll/pitch", std::max(std::abs(euler.x()), std::abs(euler.y())), max_roll_pitch_);
+            reason = describeLimit(
+                "roll/pitch radians", max_roll_pitch_radians, max_roll_pitch_);
         }
         else if (exceeds(maxCovarianceDiagonal(covariance), max_covariance_diagonal_))
         {
@@ -1081,7 +1095,6 @@ public:
 
         if (reason.empty())
         {
-            consecutive_rejects_ = 0;
             return Result{};
         }
 
@@ -1217,6 +1230,11 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter<int>("safety.checkpoint_history_size", 30);
+        this->declare_parameter<double>("safety.checkpoint_interval_sec", 1.0);
+        this->declare_parameter<double>("safety.checkpoint_min_age_sec", 2.0);
+        this->declare_parameter<int>("safety.max_checkpoint_recovery_attempts", 3);
+        this->declare_parameter<int>("safety.recovery_stable_accepts", 10);
 
         estimate_guard_ = std::make_unique<FastLioEstimateGuard>(*this);
         safety_publish_raw_debug_ = estimate_guard_->publishRawDebug();
@@ -1264,6 +1282,21 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        this->get_parameter_or<int>(
+            "safety.checkpoint_history_size", recovery_checkpoint_history_size_, 30);
+        this->get_parameter_or<double>(
+            "safety.checkpoint_interval_sec", recovery_checkpoint_interval_sec_, 1.0);
+        this->get_parameter_or<double>(
+            "safety.checkpoint_min_age_sec", recovery_checkpoint_min_age_sec_, 2.0);
+        this->get_parameter_or<int>(
+            "safety.max_checkpoint_recovery_attempts", max_checkpoint_recovery_attempts_, 3);
+        this->get_parameter_or<int>(
+            "safety.recovery_stable_accepts", recovery_stable_accepts_required_, 10);
+        recovery_checkpoint_history_size_ = std::max(1, recovery_checkpoint_history_size_);
+        recovery_checkpoint_interval_sec_ = std::max(0.0, recovery_checkpoint_interval_sec_);
+        recovery_checkpoint_min_age_sec_ = std::max(0.0, recovery_checkpoint_min_age_sec_);
+        max_checkpoint_recovery_attempts_ = std::max(1, max_checkpoint_recovery_attempts_);
+        recovery_stable_accepts_required_ = std::max(1, recovery_stable_accepts_required_);
 
         {
             std::lock_guard<std::mutex> lock(mtx_buffer);
@@ -1592,11 +1625,16 @@ void LaserMappingNode::timer_callback()
             svd_time   = 0;
             t0 = omp_get_wtime();
 
+            state_ikfom scan_start_state = kf.get_x();
+            auto scan_start_covariance = kf.get_P();
+            const auto scan_start_imu = p_imu->checkpoint();
+
             p_imu->Process(Measures, kf, feats_undistort);
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
-            const auto predicted_covariance = kf.get_P();
+            auto predicted_covariance = kf.get_P();
+            state_ikfom predicted_state = state_point;
             const V3D predicted_linear_body = state_point.rot.conjugate() * state_point.vel;
             const V3D predicted_angular_body = currentAngularVelocityBody();
             const auto predicted_validation = estimate_guard_->validate(
@@ -1607,17 +1645,13 @@ void LaserMappingNode::timer_callback()
                 RCLCPP_WARN_THROTTLE(
                     this->get_logger(), *this->get_clock(), 1000,
                     "Rejected Fast-LIO predicted estimate: %s", predicted_validation.reason.c_str());
-                if (estimate_guard_->hasAcceptedEstimate())
-                {
-                    state_ikfom accepted_state = estimate_guard_->lastAcceptedState();
-                    auto accepted_covariance = estimate_guard_->lastAcceptedCovariance();
-                    kf.change_x(accepted_state);
-                    kf.change_P(accepted_covariance);
-                    if (recovery_checkpoint) p_imu->restore(recovery_checkpoint->imu);
-                    state_point = kf.get_x();
-                    pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-                }
-                if (!estimate_guard_->hasAcceptedEstimate() || predicted_validation.reset_required)
+                recovery_stable_accepts_ = 0;
+                kf.change_x(scan_start_state);
+                kf.change_P(scan_start_covariance);
+                p_imu->restore_state_preserving_timeline(scan_start_imu);
+                state_point = kf.get_x();
+                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                if (predicted_validation.reset_required)
                 {
                     request_mapping_reset("rejected predicted estimate: " + predicted_validation.reason);
                 }
@@ -1718,18 +1752,13 @@ void LaserMappingNode::timer_callback()
                 RCLCPP_WARN_THROTTLE(
                     this->get_logger(), *this->get_clock(), 1000,
                     "Rejected Fast-LIO updated estimate: %s", updated_validation.reason.c_str());
-                if (estimate_guard_->hasAcceptedEstimate())
-                {
-                    state_ikfom accepted_state = estimate_guard_->lastAcceptedState();
-                    auto accepted_covariance = estimate_guard_->lastAcceptedCovariance();
-                    kf.change_x(accepted_state);
-                    kf.change_P(accepted_covariance);
-                    if (recovery_checkpoint) p_imu->restore(recovery_checkpoint->imu);
-                    state_point = kf.get_x();
-                    euler_cur = SO3ToEuler(state_point.rot);
-                    pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-                }
-                if (!estimate_guard_->hasAcceptedEstimate() || updated_validation.reset_required)
+                recovery_stable_accepts_ = 0;
+                kf.change_x(predicted_state);
+                kf.change_P(predicted_covariance);
+                state_point = kf.get_x();
+                euler_cur = SO3ToEuler(state_point.rot);
+                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                if (updated_validation.reset_required)
                 {
                     request_mapping_reset("rejected updated estimate: " + updated_validation.reason);
                 }
@@ -1740,10 +1769,43 @@ void LaserMappingNode::timer_callback()
             }
             estimate_guard_->recordAccepted(
                 lidar_end_time, state_point, updated_covariance, updated_linear_body, updated_angular_body);
-            recovery_checkpoint = RecoveryCheckpoint{
-                state_point, updated_covariance, p_imu->checkpoint(), lidar_end_time,
-                updated_linear_body, updated_angular_body};
-            checkpoint_recovering_ = false;
+
+            bool store_checkpoint = false;
+            if (checkpoint_recovering_)
+            {
+                ++recovery_stable_accepts_;
+                if (recovery_stable_accepts_ >= recovery_stable_accepts_required_)
+                {
+                    RCLCPP_INFO(
+                        this->get_logger(),
+                        "Fast-LIO recovery stable after %d accepted scans",
+                        recovery_stable_accepts_);
+                    checkpoint_recovering_ = false;
+                    checkpoint_recovery_attempts_ = 0;
+                    recovery_stable_accepts_ = 0;
+                    store_checkpoint = true;
+                }
+            }
+            else if (
+                recovery_checkpoints.empty() || last_recovery_checkpoint_stamp_ < 0.0 ||
+                lidar_end_time - last_recovery_checkpoint_stamp_ >= recovery_checkpoint_interval_sec_)
+            {
+                store_checkpoint = true;
+            }
+
+            if (store_checkpoint)
+            {
+                recovery_checkpoints.push_back(RecoveryCheckpoint{
+                    state_point, updated_covariance, p_imu->checkpoint(), lidar_end_time,
+                    updated_linear_body, updated_angular_body});
+                last_recovery_checkpoint_stamp_ = lidar_end_time;
+                while (
+                    recovery_checkpoints.size() >
+                    static_cast<std::size_t>(recovery_checkpoint_history_size_))
+                {
+                    recovery_checkpoints.pop_front();
+                }
+            }
             publish_slam_health(diagnostic_msgs::msg::DiagnosticStatus::OK, "OK", "Fast-LIO estimate accepted");
 
             /******* Publish odometry *******/
@@ -1810,7 +1872,8 @@ void LaserMappingNode::request_mapping_reset(const std::string & reason)
 {
         std::lock_guard<std::mutex> lock(reset_mutex_);
         reset_requested_ = true;
-        full_reset_requested_ = full_reset_requested_ || checkpoint_recovering_ || !recovery_checkpoint.has_value();
+        full_reset_requested_ = full_reset_requested_ || recovery_checkpoints.empty() ||
+            checkpoint_recovery_attempts_ >= max_checkpoint_recovery_attempts_;
         reset_reason_ = reason;
     }
 
@@ -1826,11 +1889,29 @@ void LaserMappingNode::publish_reset_event(uint8_t mode, const std::string & rea
 
 void LaserMappingNode::perform_checkpoint_restore(const std::string & reason)
 {
-        if (!recovery_checkpoint) {
+        const double recovery_stamp = lidar_end_time;
+        while (
+            !recovery_checkpoints.empty() &&
+            recovery_stamp - recovery_checkpoints.back().stamp < recovery_checkpoint_min_age_sec_)
+        {
+            recovery_checkpoints.pop_back();
+        }
+        if (
+            recovery_checkpoints.empty() ||
+            checkpoint_recovery_attempts_ >= max_checkpoint_recovery_attempts_)
+        {
             perform_mapping_reset("checkpoint unavailable: " + reason);
             return;
         }
-        RCLCPP_ERROR(this->get_logger(), "Restoring Fast-LIO checkpoint: %s", reason.c_str());
+        RecoveryCheckpoint recovery_checkpoint = recovery_checkpoints.back();
+        recovery_checkpoints.pop_back();
+        ++checkpoint_recovery_attempts_;
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Restoring Fast-LIO checkpoint %.2f s old (attempt %d/%d, %zu older checkpoints remain): %s",
+            std::max(0.0, recovery_stamp - recovery_checkpoint.stamp),
+            checkpoint_recovery_attempts_, max_checkpoint_recovery_attempts_,
+            recovery_checkpoints.size(), reason.c_str());
         publish_slam_health(diagnostic_msgs::msg::DiagnosticStatus::WARN, "RECOVERING", reason);
         {
             std::lock_guard<std::mutex> lock(mtx_buffer);
@@ -1840,17 +1921,19 @@ void LaserMappingNode::perform_checkpoint_restore(const std::string & reason)
         lidar_pushed = false;
         feats_undistort->clear(); feats_down_body->clear(); feats_down_world->clear();
         laserCloudOri->clear(); corr_normvect->clear();
-        kf.change_x(recovery_checkpoint->state);
-        kf.change_P(recovery_checkpoint->covariance);
-        p_imu->restore(recovery_checkpoint->imu);
+        kf.change_x(recovery_checkpoint.state);
+        kf.change_P(recovery_checkpoint.covariance);
+        p_imu->restore(recovery_checkpoint.imu);
+        p_imu->rebase_timeline_on_next_process();
         state_point = kf.get_x();
         pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
         estimate_guard_->reset();
         estimate_guard_->recordAccepted(
-            recovery_checkpoint->stamp, recovery_checkpoint->state,
-            recovery_checkpoint->covariance, recovery_checkpoint->linear_body,
-            recovery_checkpoint->angular_body);
+            recovery_stamp, recovery_checkpoint.state,
+            recovery_checkpoint.covariance, recovery_checkpoint.linear_body,
+            recovery_checkpoint.angular_body);
         checkpoint_recovering_ = true;
+        recovery_stable_accepts_ = 0;
         publish_reset_event(lw_messages::msg::ResetEvent::CHECKPOINT_RESTORED, reason);
 }
 
@@ -1929,8 +2012,11 @@ void LaserMappingNode::perform_mapping_reset(const std::string & reason)
         geoQuat.z = state_point.rot.coeffs()[2];
         geoQuat.w = state_point.rot.coeffs()[3];
         estimate_guard_->reset();
-        recovery_checkpoint.reset();
+        recovery_checkpoints.clear();
         checkpoint_recovering_ = false;
+        checkpoint_recovery_attempts_ = 0;
+        recovery_stable_accepts_ = 0;
+        last_recovery_checkpoint_stamp_ = -1.0;
         publish_reset_event(lw_messages::msg::ResetEvent::FULL_RESET, reason);
 
         publish_slam_health(

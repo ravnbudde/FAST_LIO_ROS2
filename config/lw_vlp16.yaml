@@ -20,11 +20,16 @@
             max_angular_acceleration: 10.0
             max_pose_jump: 1.0
             max_vertical_speed: 0.7
-            max_roll_pitch: 0.7
+            max_roll_pitch_rad: 0.7
             max_covariance_diagonal: 0.0
             max_covariance_trace: 0.0
             max_consecutive_rejects: 3
             reset_cooldown_sec: 5.0
+            checkpoint_history_size: 30
+            checkpoint_interval_sec: 1.0
+            checkpoint_min_age_sec: 2.0
+            max_checkpoint_recovery_attempts: 3
+            recovery_stable_accepts: 10
             publish_raw_debug: false
 
         common:

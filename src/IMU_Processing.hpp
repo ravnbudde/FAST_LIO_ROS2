@@ -49,6 +49,8 @@ class ImuProcess
 
   Checkpoint checkpoint() const;
   void restore(const Checkpoint & checkpoint);
+  void restore_state_preserving_timeline(const Checkpoint & checkpoint);
+  void rebase_timeline_on_next_process();
 
   ImuProcess();
   ~ImuProcess();
@@ -96,6 +98,7 @@ class ImuProcess
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
+  bool   timeline_rebase_pending_ = false;
 };
 
 ImuProcess::ImuProcess()
@@ -145,8 +148,27 @@ void ImuProcess::restore(const Checkpoint & in)
   first_lidar_time = in.first_lidar_time; start_timestamp_ = in.start_timestamp;
   last_lidar_end_time_ = in.last_lidar_end_time; init_iter_num = in.init_iter_num;
   b_first_frame_ = in.first_frame; imu_need_init_ = in.imu_needs_init;
+  timeline_rebase_pending_ = false;
   v_imu_.clear(); IMUpose.clear(); v_rot_pcl_.clear();
   cur_pcl_un_.reset(new PointCloudXYZI());
+}
+
+void ImuProcess::restore_state_preserving_timeline(const Checkpoint & in)
+{
+  const auto current_last_imu = last_imu_;
+  const double current_last_lidar_end_time = last_lidar_end_time_;
+  const V3D current_angvel_last = angvel_last;
+  const V3D current_acc_s_last = acc_s_last;
+  restore(in);
+  last_imu_ = current_last_imu;
+  last_lidar_end_time_ = current_last_lidar_end_time;
+  angvel_last = current_angvel_last;
+  acc_s_last = current_acc_s_last;
+}
+
+void ImuProcess::rebase_timeline_on_next_process()
+{
+  timeline_rebase_pending_ = true;
 }
 
 void ImuProcess::Reset() 
@@ -158,6 +180,7 @@ void ImuProcess::Reset()
   imu_need_init_    = true;
   start_timestamp_  = -1;
   init_iter_num     = 1;
+  timeline_rebase_pending_ = false;
   v_imu_.clear();
   IMUpose.clear();
   last_imu_.reset(new sensor_msgs::msg::Imu());
@@ -417,6 +440,13 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
     }
 
     return;
+  }
+
+  if (timeline_rebase_pending_)
+  {
+    last_imu_ = meas.imu.front();
+    last_lidar_end_time_ = meas.lidar_beg_time;
+    timeline_rebase_pending_ = false;
   }
 
   UndistortPcl(meas, kf_state, *cur_pcl_un_);
