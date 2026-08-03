@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <memory>
@@ -11,6 +12,7 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #endif
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <lw_messages/msg/reset_event.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -39,6 +41,8 @@ private:
     void reset_mapping_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res);
     void request_mapping_reset(const std::string & reason);
     void perform_mapping_reset(const std::string & reason);
+    void perform_checkpoint_restore(const std::string & reason);
+    void publish_reset_event(uint8_t mode, const std::string & reason);
     void publish_slam_health(unsigned char level, const std::string & state, const std::string & message);
     void publish_raw_odometry();
     void write_runtime_outputs();
@@ -52,6 +56,7 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubRawOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubSlamHealth_;
+    rclcpp::Publisher<lw_messages::msg::ResetEvent>::SharedPtr pubResetEvent_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
 #ifdef FAST_LIO_ENABLE_LIVOX
@@ -68,6 +73,9 @@ private:
     std::unique_ptr<FastLioEstimateGuard> estimate_guard_;
     std::mutex reset_mutex_;
     bool reset_requested_ = false;
+    bool full_reset_requested_ = false;
+    bool checkpoint_recovering_ = false;
+    std::uint64_t reset_epoch_ = 0;
     bool safety_publish_raw_debug_ = false;
     bool sensor_setup_ready_ = false;
     std::chrono::steady_clock::time_point last_tf_lookup_attempt_{};

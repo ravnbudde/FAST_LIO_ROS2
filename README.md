@@ -59,7 +59,7 @@ ros2 launch fast_lio mapping_composed.launch.py config_file:=lw_vlp16.yaml
 
 Safety parameters live under `safety.*` in the Fast-LIO YAML config. The defaults are intentionally conservative and should be tuned from logs if normal operation triggers rejections. Set `safety.publish_raw_debug: true` to publish rejected candidate odometry on `/Odometry/raw` for diagnosis.
 
-Recovery is available through `~/reset_mapping` (`std_srvs/srv/Trigger`). The same reset path is requested automatically after `safety.max_consecutive_rejects` rejected estimates. Reset clears buffered sensor data, the local Fast-LIO map, path/cloud accumulators, IMU preprocessing state, and EKF state, then waits for a fresh initialization. Health is published on `~/health` as `diagnostic_msgs/msg/DiagnosticArray`.
+Recovery first restores the latest accepted EKF and IMU checkpoint after `safety.max_consecutive_rejects` rejected estimates. Continued instability escalates to a full reset, which clears buffered sensor data, the local map, accumulated outputs, IMU preprocessing state, and EKF state before waiting for fresh initialization. Operators can request that full reset through `~/reset_mapping` (`std_srvs/srv/Trigger`). Both recovery modes are published on `~/reset_event` as `lw_messages/msg/ResetEvent`, allowing SLAM back ends and other consumers to react without depending on Fast-LIO's package interfaces. Health is published on `~/health` as `diagnostic_msgs/msg/DiagnosticArray`.
 
 ## Full Stack Usage
 

@@ -33,6 +33,23 @@ class ImuProcess
  public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+  struct Checkpoint
+  {
+    Eigen::Matrix<double, 12, 12> Q;
+    V3D cov_acc, cov_gyr, cov_acc_scale, cov_gyr_scale, cov_bias_gyr, cov_bias_acc;
+    V3D mean_acc, mean_gyr, angvel_last, acc_s_last;
+    M3D lidar_rotation;
+    V3D lidar_translation;
+    sensor_msgs::msg::Imu last_imu;
+    double first_lidar_time{0.0}, start_timestamp{-1.0}, last_lidar_end_time{0.0};
+    int init_iter_num{1};
+    bool first_frame{true};
+    bool imu_needs_init{true};
+  };
+
+  Checkpoint checkpoint() const;
+  void restore(const Checkpoint & checkpoint);
+
   ImuProcess();
   ~ImuProcess();
   
@@ -75,7 +92,7 @@ class ImuProcess
   V3D angvel_last;
   V3D acc_s_last;
   double start_timestamp_;
-  double last_lidar_end_time_;
+  double last_lidar_end_time_ = 0.0;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -99,6 +116,38 @@ ImuProcess::ImuProcess()
 }
 
 ImuProcess::~ImuProcess() {}
+
+ImuProcess::Checkpoint ImuProcess::checkpoint() const
+{
+  Checkpoint out;
+  out.Q = Q; out.cov_acc = cov_acc; out.cov_gyr = cov_gyr;
+  out.cov_acc_scale = cov_acc_scale; out.cov_gyr_scale = cov_gyr_scale;
+  out.cov_bias_gyr = cov_bias_gyr; out.cov_bias_acc = cov_bias_acc;
+  out.mean_acc = mean_acc; out.mean_gyr = mean_gyr;
+  out.angvel_last = angvel_last; out.acc_s_last = acc_s_last;
+  out.lidar_rotation = Lidar_R_wrt_IMU; out.lidar_translation = Lidar_T_wrt_IMU;
+  if (last_imu_) out.last_imu = *last_imu_;
+  out.first_lidar_time = first_lidar_time; out.start_timestamp = start_timestamp_;
+  out.last_lidar_end_time = last_lidar_end_time_; out.init_iter_num = init_iter_num;
+  out.first_frame = b_first_frame_; out.imu_needs_init = imu_need_init_;
+  return out;
+}
+
+void ImuProcess::restore(const Checkpoint & in)
+{
+  Q = in.Q; cov_acc = in.cov_acc; cov_gyr = in.cov_gyr;
+  cov_acc_scale = in.cov_acc_scale; cov_gyr_scale = in.cov_gyr_scale;
+  cov_bias_gyr = in.cov_bias_gyr; cov_bias_acc = in.cov_bias_acc;
+  mean_acc = in.mean_acc; mean_gyr = in.mean_gyr;
+  angvel_last = in.angvel_last; acc_s_last = in.acc_s_last;
+  Lidar_R_wrt_IMU = in.lidar_rotation; Lidar_T_wrt_IMU = in.lidar_translation;
+  last_imu_ = std::make_shared<sensor_msgs::msg::Imu>(in.last_imu);
+  first_lidar_time = in.first_lidar_time; start_timestamp_ = in.start_timestamp;
+  last_lidar_end_time_ = in.last_lidar_end_time; init_iter_num = in.init_iter_num;
+  b_first_frame_ = in.first_frame; imu_need_init_ = in.imu_needs_init;
+  v_imu_.clear(); IMUpose.clear(); v_rot_pcl_.clear();
+  cur_pcl_un_.reset(new PointCloudXYZI());
+}
 
 void ImuProcess::Reset() 
 {

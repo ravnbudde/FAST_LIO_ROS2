@@ -909,6 +909,18 @@ namespace
 
 using GuardCovariance = esekfom::esekf<state_ikfom, 12, input_ikfom>::cov;
 
+struct RecoveryCheckpoint
+{
+    state_ikfom state;
+    GuardCovariance covariance;
+    ImuProcess::Checkpoint imu;
+    double stamp{0.0};
+    V3D linear_body{Zero3d};
+    V3D angular_body{Zero3d};
+};
+
+std::optional<RecoveryCheckpoint> recovery_checkpoint;
+
 bool isFinite(double value)
 {
     return std::isfinite(value);
@@ -1342,6 +1354,8 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions& options) : Node("l
         }
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         pubSlamHealth_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("~/health", 10);
+        pubResetEvent_ = this->create_publisher<lw_messages::msg::ResetEvent>(
+            "~/reset_event", rclcpp::QoS(1).reliable().transient_local());
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
         if (get_extrinsic_from_tf)
         {
@@ -1532,18 +1546,25 @@ void LaserMappingNode::write_runtime_outputs()
 void LaserMappingNode::timer_callback()
 {
         std::string reset_reason;
+        bool perform_full_reset = false;
         {
             std::lock_guard<std::mutex> lock(reset_mutex_);
             if (reset_requested_)
             {
                 reset_reason = reset_reason_;
+                perform_full_reset = full_reset_requested_;
                 reset_requested_ = false;
+                full_reset_requested_ = false;
                 reset_reason_.clear();
             }
         }
         if (!reset_reason.empty())
         {
-            perform_mapping_reset(reset_reason);
+            if (perform_full_reset) {
+                perform_mapping_reset(reset_reason);
+            } else {
+                perform_checkpoint_restore(reset_reason);
+            }
             return;
         }
 
@@ -1592,6 +1613,7 @@ void LaserMappingNode::timer_callback()
                     auto accepted_covariance = estimate_guard_->lastAcceptedCovariance();
                     kf.change_x(accepted_state);
                     kf.change_P(accepted_covariance);
+                    if (recovery_checkpoint) p_imu->restore(recovery_checkpoint->imu);
                     state_point = kf.get_x();
                     pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
                 }
@@ -1702,6 +1724,7 @@ void LaserMappingNode::timer_callback()
                     auto accepted_covariance = estimate_guard_->lastAcceptedCovariance();
                     kf.change_x(accepted_state);
                     kf.change_P(accepted_covariance);
+                    if (recovery_checkpoint) p_imu->restore(recovery_checkpoint->imu);
                     state_point = kf.get_x();
                     euler_cur = SO3ToEuler(state_point.rot);
                     pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -1717,6 +1740,10 @@ void LaserMappingNode::timer_callback()
             }
             estimate_guard_->recordAccepted(
                 lidar_end_time, state_point, updated_covariance, updated_linear_body, updated_angular_body);
+            recovery_checkpoint = RecoveryCheckpoint{
+                state_point, updated_covariance, p_imu->checkpoint(), lidar_end_time,
+                updated_linear_body, updated_angular_body};
+            checkpoint_recovering_ = false;
             publish_slam_health(diagnostic_msgs::msg::DiagnosticStatus::OK, "OK", "Fast-LIO estimate accepted");
 
             /******* Publish odometry *******/
@@ -1770,6 +1797,10 @@ void LaserMappingNode::reset_mapping_callback(
     std_srvs::srv::Trigger::Request::ConstSharedPtr /*req*/,
     std_srvs::srv::Trigger::Response::SharedPtr res)
 {
+        {
+            std::lock_guard<std::mutex> lock(reset_mutex_);
+            full_reset_requested_ = true;
+        }
         request_mapping_reset("manual reset_mapping service call");
         res->success = true;
         res->message = "Fast-LIO mapping reset requested.";
@@ -1779,8 +1810,49 @@ void LaserMappingNode::request_mapping_reset(const std::string & reason)
 {
         std::lock_guard<std::mutex> lock(reset_mutex_);
         reset_requested_ = true;
+        full_reset_requested_ = full_reset_requested_ || checkpoint_recovering_ || !recovery_checkpoint.has_value();
         reset_reason_ = reason;
     }
+
+void LaserMappingNode::publish_reset_event(uint8_t mode, const std::string & reason)
+{
+        lw_messages::msg::ResetEvent event;
+        event.stamp = this->now();
+        event.epoch = ++reset_epoch_;
+        event.mode = mode;
+        event.reason = reason;
+        pubResetEvent_->publish(event);
+}
+
+void LaserMappingNode::perform_checkpoint_restore(const std::string & reason)
+{
+        if (!recovery_checkpoint) {
+            perform_mapping_reset("checkpoint unavailable: " + reason);
+            return;
+        }
+        RCLCPP_ERROR(this->get_logger(), "Restoring Fast-LIO checkpoint: %s", reason.c_str());
+        publish_slam_health(diagnostic_msgs::msg::DiagnosticStatus::WARN, "RECOVERING", reason);
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            lidar_buffer.clear(); time_buffer.clear(); imu_buffer.clear();
+        }
+        Measures = MeasureGroup();
+        lidar_pushed = false;
+        feats_undistort->clear(); feats_down_body->clear(); feats_down_world->clear();
+        laserCloudOri->clear(); corr_normvect->clear();
+        kf.change_x(recovery_checkpoint->state);
+        kf.change_P(recovery_checkpoint->covariance);
+        p_imu->restore(recovery_checkpoint->imu);
+        state_point = kf.get_x();
+        pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+        estimate_guard_->reset();
+        estimate_guard_->recordAccepted(
+            recovery_checkpoint->stamp, recovery_checkpoint->state,
+            recovery_checkpoint->covariance, recovery_checkpoint->linear_body,
+            recovery_checkpoint->angular_body);
+        checkpoint_recovering_ = true;
+        publish_reset_event(lw_messages::msg::ResetEvent::CHECKPOINT_RESTORED, reason);
+}
 
 void LaserMappingNode::perform_mapping_reset(const std::string & reason)
 {
@@ -1857,6 +1929,9 @@ void LaserMappingNode::perform_mapping_reset(const std::string & reason)
         geoQuat.z = state_point.rot.coeffs()[2];
         geoQuat.w = state_point.rot.coeffs()[3];
         estimate_guard_->reset();
+        recovery_checkpoint.reset();
+        checkpoint_recovering_ = false;
+        publish_reset_event(lw_messages::msg::ResetEvent::FULL_RESET, reason);
 
         publish_slam_health(
             diagnostic_msgs::msg::DiagnosticStatus::STALE, "UNINITIALIZED",
